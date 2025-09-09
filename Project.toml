@@ -1,0 +1,33 @@
+name = "ChordChain"
+uuid = "b546ee15-7e34-46ef-a4d7-a199e1f966f8"
+authors = ["Sam Anklesaria <anklesarian@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+BlockArrays = "8e7c35d0-a365-5155-bbbb-fb81a777f24e"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
+Infiltrator = "5903a43b-9cc3-4c30-8d17-598619ec4e9b"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
+MusicTheory = "564e61e1-4667-41b2-a4a2-754a0240c775"
+ProfileView = "c46f51b8-102a-5cf2-8d2c-8597cb0e0da7"
+PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
+Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
+SizeCheck = "e0176837-3861-45f9-8fb4-a12fc39b9661"
+StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
+ToeplitzMatrices = "c751599d-da0a-543b-9d20-d0a503d91d24"
+
+[compat]
+BlockArrays = "1.7.2"
+DataFrames = "1.7.1"
+DelimitedFiles = "1.9.1"
+Infiltrator = "1.9.3"
+LinearAlgebra = "1.11.0"
+LogExpFunctions = "0.3.29"
+MusicTheory = "0.1.0"
+ProfileView = "1.10.2"
+PythonCall = "0.9.27"
+Revise = "3.9.0"
+StatsBase = "0.34.6"
+ToeplitzMatrices = "0.8.5"
