@@ -130,6 +130,24 @@ end
 # Let's do a log space one. We might be able to do something simpler as a result.
 # Also: let's test the FB algorithm by simulating from known distributions and trying to recover the truth.
 
+# Hm: note that we aren't removing empty chroma chords anymore. So these will have zero dot products.
+# So they'lll produce probability zero in the HMM. That's probably the source of the NaNs.
+
+# To fix this, we can do what we were going to do anyway: use Gaussians pdfs rather than dot products.
+# We'll need to get the variance of the chord templates.
+# The other problem is normalization. We've been normalizing the templates. But is that really wise?
+# Perhaps what makes the 'no-chord' so characteristic is that it doesn't have any chroma content.
+
+# We don't actually have normalized templates: the mean of unit-norm vectors is not necesarily unit norm!
+
+# Can we we make the distance calculation fast still?
+
+# TODO:
+# 1. Calculate the variance of the chord templates.
+# 2. Implement a fast distance calculation method using these variances.
+# 3. Use the normal pdf instead of the dot product for the likelihood calculation.
+# 4. Rewrite the HMM in log space.
+
 @sizecheck function accuracy(df, test_dfs)
     all_hops = crossjoin(DataFrame(scale=0:2), DataFrame(hops=0:24))
     hop_counts = combine(groupby(df, [:scale, :hops]), :hops => (x -> size(x, 1)) => :count)
