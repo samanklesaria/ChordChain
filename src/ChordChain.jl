@@ -1,10 +1,11 @@
 module ChordChain
+using Base: AbstractArrayOrBroadcasted
 using SizeCheck
-using DataFrames, StatsBase, ToeplitzMatrices, PythonCall, DelimitedFiles, MusicTheory, BlockArrays, LinearAlgebra
+using DataFrames, StatsBase, ToeplitzMatrices, PythonCall, DelimitedFiles, MusicTheory, BlockArrays, LinearAlgebra, LogExpFunctions
 using Infiltrator
 using GLMakie
 
-export forward_backward, load_df, accuracy
+export forward_backward_logscale, forward_backward, load_df, accuracy, doit
 
 const ACCIDENTALS = Dict('b' => ♭, '#' => ♯)
 const SCALES = Dict{String,Int8}("maj" => 0, "min" => 1)
@@ -32,11 +33,10 @@ to_pitch(a) = semitone(length(a) == 1 ? PitchClass(Symbol(a[1])) : PitchClass(Sy
             # Extract and normalize chroma
             cqt_data = readdlm(joinpath(mcgill_path, "metadata/metadata/$f/bothchroma.csv"), ',')
             chroma24 = Matrix{Float64}(cqt_data[:, 3:end])
-            y_TC = chroma24[:, 1:12] + chroma24[:, 13:24]
+            y_TC = chroma24[:, 1:12] .+ chroma24[:, 13:24] .+ 1e-8
             y_TC = circshift(y_TC, (0, -3)) # First chroma bin corresponds to A, not C
             sums_T = norm.(eachrow(y_TC))
-            chroma_mask_T = sums_T .> 0
-            y_TC[chroma_mask_T, :] ./= sums_T[chroma_mask_T, :]
+            y_TC ./= sums_T
             frame_secs = cqt_data[2, 2] - cqt_data[1, 2]
 
             # Extract annotations
@@ -67,13 +67,37 @@ to_pitch(a) = semitone(length(a) == 1 ? PitchClass(Symbol(a[1])) : PitchClass(Sy
             hops[tdf.z[2:end].==0] .= 24
             push!(hops, 24)
             shifted_y = circshift.(tdf.y, .-tdf.pitch)
-            tdf[!, :shifted_y] = shifted_y
 
             push!(train_dfs, DataFrame(scale=tdf.scale, shifted_y=shifted_y, hops=hops))
-            push!(test_dfs, tdf[!, [:y, :z, :shifted_y]])
+            push!(test_dfs, tdf[!, [:y, :z]])
         end
     end
     reduce(vcat, train_dfs), test_dfs
+end
+
+"Numerically stable version of `log.(exp.(A) * exp.(v))`"
+log_matmul(A, v) = logsumexp.(eachrow(A) .+ Ref(v))
+
+@sizecheck function forward_backward_logscale(P_DD, y_CT, templates_DC)
+    alpha_DT = zeros(D, T)
+
+    # Forward
+    for t in 1:T
+        lik_D = 2 * (templates_DC * y_CT[:, t])
+        alpha_DT[:, t] = alpha_DT[:, t] .+ lik_D
+        if t < T
+            alpha_DT[:, t+1] .= log_matmul(P_DD, alpha_DT[:, t])
+        end
+    end
+
+    # Backward
+    beta_DT = zeros(D, T)
+    for t in (T-1):-1:1
+        lik_D = 2 * (templates_DC * y_CT[:, t+1])
+        beta_DT[:, t] .= log_matmul(P_DD', beta_DT[:, t+1] .+ lik_D)
+    end
+
+    softmax(alpha_DT .+ beta_DT; dims=1)
 end
 
 @sizecheck function forward_backward(P_DD, y_CT, templates_DC)
@@ -83,7 +107,7 @@ end
 
     # Forward
     for t in 1:T
-        lik_D = templates_DC * y_CT[:, t]
+        lik_D = exp.(2 * (templates_DC * y_CT[:, t]))
         joint_D = z_DT[:, t] .* lik_D
         obs_prob_T[t] = sum(joint_D)
         z_DT[:, t] .= joint_D ./ obs_prob_T[t]
@@ -96,7 +120,7 @@ end
     betas_DT = zeros(D, T)
     betas_DT[:, T] = ones(D)
     for t in T:-1:2
-        lik_D = templates_DC * y_CT[:, t]
+        lik_D = exp.(2 * (templates_DC * y_CT[:, t]))
         betas_DT[:, t-1] .= (P_DD' * (lik_D .* betas_DT[:, t])) ./ obs_prob_T[t]
     end
 
@@ -148,6 +172,13 @@ end
 # 3. Use the normal pdf instead of the dot product for the likelihood calculation.
 # 4. Rewrite the HMM in log space.
 
+@sizecheck function mean_and_cov(x_T)
+    m_C = mean(x_T)
+    x_CT = stack(x_T)
+    X_CT = x_CT .- reshape(m_C, C, 1)
+    (y=[m_C], y_var=[X_CT * X_CT' ./ (T - 1)])
+end
+
 @sizecheck function accuracy(df, test_dfs)
     all_hops = crossjoin(DataFrame(scale=0:2), DataFrame(hops=0:24))
     hop_counts = combine(groupby(df, [:scale, :hops]), :hops => (x -> size(x, 1)) => :count)
@@ -155,6 +186,9 @@ end
     hop_count_mat = reshape(hop_counts.count, (:, 3))
     P_DM = hop_count_mat ./ sum(hop_count_mat; dims=1)
     templates_CM = reduce(hcat, combine(groupby(df, :scale), :shifted_y => (x -> [mean(x)]) => :y).y)
+    # df = combine(groupby(df, :scale), :shifted_y => (x -> mean_and_cov(x)) => [:y, :y_var])
+    # templates_CM = stack(df.y)
+    # templates_CCM = stack(df.y_var) # TODO: how to turn this into templates_DCC?
     templates_DC = mortar(reshape(
         [Circulant(templates_CM[:, 1]), Circulant(templates_CM[:, 2]), templates_CM[:, 3:3]], 1, 3))'
     blocks = [to_block(P_DM, i, j) for j in [1, 2, 3] for i in [1:12, 13:24, 25:25]]
@@ -165,6 +199,11 @@ end
         pred_DT = forward_backward(P_DD, y_CT, templates_DC)
         mean(pred_DT[CartesianIndex.(z_T, 1:T)]) / length(test_dfs)
     end
+end
+
+# 64%? That's terrible!
+function doit()
+    accuracy(load_df(100)...)
 end
 
 end # module ChordChain
