@@ -1,6 +1,8 @@
 module ChordChain
 using SizeCheck
-using DataFrames, StatsBase, ToeplitzMatrices, PythonCall, DelimitedFiles, MusicTheory, BlockArrays, Infiltrator
+using DataFrames, StatsBase, ToeplitzMatrices, PythonCall, DelimitedFiles, MusicTheory, BlockArrays, LinearAlgebra
+using Infiltrator
+using GLMakie
 
 export forward_backward, load_df, accuracy
 
@@ -30,10 +32,11 @@ to_pitch(a) = semitone(length(a) == 1 ? PitchClass(Symbol(a[1])) : PitchClass(Sy
             # Extract and normalize chroma
             cqt_data = readdlm(joinpath(mcgill_path, "metadata/metadata/$f/bothchroma.csv"), ',')
             chroma24 = Matrix{Float64}(cqt_data[:, 3:end])
-            chroma = chroma24[:, 1:12] + chroma24[:, 13:24]
-            sums = vec(sum(chroma, dims=2))
-            chroma_mask = sums .> 0
-            y_TC = chroma[chroma_mask, :] ./ sums[chroma_mask, :]
+            y_TC = chroma24[:, 1:12] + chroma24[:, 13:24]
+            y_TC = circshift(y_TC, (0, -3)) # First chroma bin corresponds to A, not C
+            sums_T = norm.(eachrow(y_TC))
+            chroma_mask_T = sums_T .> 0
+            y_TC[chroma_mask_T, :] ./= sums_T[chroma_mask_T, :]
             frame_secs = cqt_data[2, 2] - cqt_data[1, 2]
 
             # Extract annotations
@@ -64,9 +67,10 @@ to_pitch(a) = semitone(length(a) == 1 ? PitchClass(Symbol(a[1])) : PitchClass(Sy
             hops[tdf.z[2:end].==0] .= 24
             push!(hops, 24)
             shifted_y = circshift.(tdf.y, .-tdf.pitch)
+            tdf[!, :shifted_y] = shifted_y
 
             push!(train_dfs, DataFrame(scale=tdf.scale, shifted_y=shifted_y, hops=hops))
-            push!(test_dfs, tdf[!, [:y, :z]])
+            push!(test_dfs, tdf[!, [:y, :z, :shifted_y]])
         end
     end
     reduce(vcat, train_dfs), test_dfs
@@ -109,7 +113,22 @@ function to_block(P_DM, i, j)
     end
 end
 
-# TODO: visualize the P_DD and templates_DC matrices
+function heatmap_with_colorbar(m)
+    f = Figure()
+    ax = Axis(f[1, 1])
+    hm = heatmap!(ax, m)
+    Colorbar(f[1, 2], hm)
+    f
+end
+
+# From the plot, we see that the self-transition probabilities are thousands of times higher than the transition probabilities between chords.
+# To combat this, what can we do?
+# We can use a non-exponential distribution for the chord transition timing.
+# But first things first: how well does this work?
+
+# Hm. Nan. Does that come from the fact that that our FB alg isn't in log space?
+# Let's do a log space one. We might be able to do something simpler as a result.
+# Also: let's test the FB algorithm by simulating from known distributions and trying to recover the truth.
 
 @sizecheck function accuracy(df, test_dfs)
     all_hops = crossjoin(DataFrame(scale=0:2), DataFrame(hops=0:24))
