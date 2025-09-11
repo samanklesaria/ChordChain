@@ -1,7 +1,7 @@
 module ChordChain
-using Base: AbstractArrayOrBroadcasted
 using SizeCheck
 using DataFrames, StatsBase, ToeplitzMatrices, PythonCall, DelimitedFiles, MusicTheory, BlockArrays, LinearAlgebra, LogExpFunctions, FillArrays
+using Smoothers
 import DataFrames: StackedVector
 using Infiltrator
 using GLMakie
@@ -23,6 +23,8 @@ to_pitch(a) = semitone(length(a) == 1 ? PitchClass(Symbol(a[1])) : PitchClass(Sy
 # 24 represents a transition to the no_chord state.
 # We keep track of hop-probabilities separately for major starting chords, minor starting chords, and no_chord.
 
+const CHUNK = 8
+
 @sizecheck function load_df(k)
     kagglehub = pyimport("kagglehub")
     mcgill_path = pyconvert(String, kagglehub.dataset_download("jacobvs/mcgill-billboard"))
@@ -31,22 +33,25 @@ to_pitch(a) = semitone(length(a) == 1 ? PitchClass(Symbol(a[1])) : PitchClass(Sy
     for f in readdir(joinpath(mcgill_path, "annotations/annotations/"))[1:k]
         if !startswith(f, '.')
 
-            # Extract and normalize chroma
-            cqt_data = readdlm(joinpath(mcgill_path, "metadata/metadata/$f/bothchroma.csv"), ',')
-            chroma24 = Matrix{Float64}(cqt_data[:, 3:end])
-            y_TC = chroma24[:, 1:12] .+ chroma24[:, 13:24] .+ 1e-8
-            y_TC = circshift(y_TC, (0, -3)) # First chroma bin corresponds to A, not C
-            sums_T = norm.(eachrow(y_TC))
-            y_TC ./= sums_T
-            frame_secs = cqt_data[2, 2] - cqt_data[1, 2]
-
-            # Extract annotations
+            # Check if annotations exist
             adata = readdlm(joinpath(mcgill_path, "annotations/annotations/$f/majmin.lab"))
             chords = split.(adata[:, 3], ":")
             a_mask = length.(chords) .== 2
             if sum(a_mask) == 0
                 continue # This file contains no annotations
             end
+
+            # Extract and normalize chroma
+            cqt_data = readdlm(joinpath(mcgill_path, "metadata/metadata/$f/bothchroma.csv"), ',')
+            chroma24 = Matrix{Float64}(cqt_data[:, 3:end])
+            y_SC = chroma24[:, 1:12] .+ chroma24[:, 13:24] .+ 1e-8
+            y_SC = circshift(y_SC, (0, -3)) # First chroma bin corresponds to A, not C
+            y_SC ./= mapslices(norm, y_SC; dims=2)
+            y_SC = mapslices(x->hma(x, 13), y_SC; dims=1)
+            y_TC =y_SC[1:CHUNK:end,:]
+            frame_secs = CHUNK * (cqt_data[2, 2] - cqt_data[1, 2])
+
+            # Extract annotations
             chords_PA = reduce(hcat, chords[a_mask])
             pitch_A = to_pitch.(chords_PA[1, :])
             scale_A = [SCALES[a] for a in chords_PA[2, :]]
@@ -119,13 +124,14 @@ end
 # We can use a non-exponential distribution for the chord transition timing.
 # But first things first: how well does this work?
 
-# TODO:
-# 1. Calculate the variance of the chord templates.
-# 2. Implement a fast distance calculation method using these variances.
 
 # Debugging
-# - Could see what the predictions actually are? And where it's having trouble? Is it never predicting a change?
 # - Could compare the group specific covariance matrix to the single variance parameter we're using currently.
+# - If necessary, add group specific variances to the model.
+# - Could examine a case where the fit is especially poor. See what pathologies there are.
+
+# We could visualize the predictions.
+# How do we show the correct answers?
 
 @sizecheck function mean_and_cov(x_T)
     m_C = mean(x_T)
@@ -147,19 +153,29 @@ end
     blocks = [to_block(P_DM, i, j) for j in [1, 2, 3] for i in [1:12, 13:24, 25:25]]
     P_DD = mortar(reshape(blocks, 3, 3))
     norms_D = StackedVector(Fill.(vec(sum(templates_CM .^ 2, dims=1)), [12,12,1]))
-    # println(norms_D)
-    println("S $s")
-    # That's odd- the norms are half of what I expected.
-    sum(test_dfs) do tdf
+    # norms_D = Fill(1.0, 25)
+    # println("S $s")
+
+    tdf = test_dfs[1]
+    # sum(test_dfs) do tdf
         y_CT = reduce(hcat, tdf.y)
         z_T = tdf.z
         pred_DT = forward_backward(P_DD, y_CT, templates_DC, norms_D, s)
-        mean(pred_DT[CartesianIndex.(z_T, 1:T)]) / length(test_dfs)
-    end
+        println("Accuracy ", mean(pred_DT[CartesianIndex.(z_T, 1:T)])) #  / length(test_dfs))
+        visualize_results(pred_DT, z_T)
+    # end
 end
 
-# 66%? That's terrible!
-# And when we tried to scale by variance, we went down to 60!
+@sizecheck function visualize_results(pred_DL, z_L)
+    fig = Figure()
+    ax = Axis(fig[1, 1])
+    hm = heatmap!(ax, pred_DL')
+    Colorbar(fig[1, 2], hm)
+    scatter!(ax, 1:L, z_L, strokewidth=0.5, color=:red)
+    fig
+end
+
+# 77%
 function doit()
     accuracy(load_df(100)...)
 end
