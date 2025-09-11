@@ -1,11 +1,12 @@
 module ChordChain
 using Base: AbstractArrayOrBroadcasted
 using SizeCheck
-using DataFrames, StatsBase, ToeplitzMatrices, PythonCall, DelimitedFiles, MusicTheory, BlockArrays, LinearAlgebra, LogExpFunctions
+using DataFrames, StatsBase, ToeplitzMatrices, PythonCall, DelimitedFiles, MusicTheory, BlockArrays, LinearAlgebra, LogExpFunctions, FillArrays
+import DataFrames: StackedVector
 using Infiltrator
 using GLMakie
 
-export forward_backward_logscale, forward_backward, load_df, accuracy, doit
+export forward_backward, load_df, accuracy, doit
 
 const ACCIDENTALS = Dict('b' => ♭, '#' => ♯)
 const SCALES = Dict{String,Int8}("maj" => 0, "min" => 1)
@@ -75,40 +76,17 @@ to_pitch(a) = semitone(length(a) == 1 ? PitchClass(Symbol(a[1])) : PitchClass(Sy
     reduce(vcat, train_dfs), test_dfs
 end
 
-"Numerically stable version of `log.(exp.(A) * exp.(v))`"
-log_matmul(A, v) = logsumexp.(eachrow(A) .+ Ref(v))
-
-@sizecheck function forward_backward_logscale(P_DD, y_CT, templates_DC)
-    alpha_DT = zeros(D, T)
-
-    # Forward
-    for t in 1:T
-        lik_D = 2 * (templates_DC * y_CT[:, t])
-        alpha_DT[:, t] = alpha_DT[:, t] .+ lik_D
-        if t < T
-            alpha_DT[:, t+1] .= log_matmul(P_DD, alpha_DT[:, t])
-        end
-    end
-
-    # Backward
-    beta_DT = zeros(D, T)
-    for t in (T-1):-1:1
-        lik_D = 2 * (templates_DC * y_CT[:, t+1])
-        beta_DT[:, t] .= log_matmul(P_DD', beta_DT[:, t+1] .+ lik_D)
-    end
-
-    softmax(alpha_DT .+ beta_DT; dims=1)
-end
-
-@sizecheck function forward_backward(P_DD, y_CT, templates_DC)
+@sizecheck function forward_backward(P_DD, y_CT, templates_DC, template_norms_D, s)
     z_DT = zeros(D, T)
     z_DT[:, 1] .= ones(D) ./ D
     obs_prob_T = zeros(T)
 
+    products_DT = templates_DC * y_CT
+    lik_DT = exp.((products_DT .- 0.5 .* template_norms_D) ./ s)
+
     # Forward
     for t in 1:T
-        lik_D = exp.(2 * (templates_DC * y_CT[:, t]))
-        joint_D = z_DT[:, t] .* lik_D
+        joint_D = z_DT[:, t] .* lik_DT[:, t]
         obs_prob_T[t] = sum(joint_D)
         z_DT[:, t] .= joint_D ./ obs_prob_T[t]
         if t < T
@@ -120,8 +98,7 @@ end
     betas_DT = zeros(D, T)
     betas_DT[:, T] = ones(D)
     for t in T:-1:2
-        lik_D = exp.(2 * (templates_DC * y_CT[:, t]))
-        betas_DT[:, t-1] .= (P_DD' * (lik_D .* betas_DT[:, t])) ./ obs_prob_T[t]
+        betas_DT[:, t-1] .= (P_DD' * (lik_DT[:, t] .* betas_DT[:, t])) ./ obs_prob_T[t]
     end
 
     betas_DT .* z_DT
@@ -137,40 +114,18 @@ function to_block(P_DM, i, j)
     end
 end
 
-function heatmap_with_colorbar(m)
-    f = Figure()
-    ax = Axis(f[1, 1])
-    hm = heatmap!(ax, m)
-    Colorbar(f[1, 2], hm)
-    f
-end
-
 # From the plot, we see that the self-transition probabilities are thousands of times higher than the transition probabilities between chords.
 # To combat this, what can we do?
 # We can use a non-exponential distribution for the chord transition timing.
 # But first things first: how well does this work?
 
-# Hm. Nan. Does that come from the fact that that our FB alg isn't in log space?
-# Let's do a log space one. We might be able to do something simpler as a result.
-# Also: let's test the FB algorithm by simulating from known distributions and trying to recover the truth.
-
-# Hm: note that we aren't removing empty chroma chords anymore. So these will have zero dot products.
-# So they'lll produce probability zero in the HMM. That's probably the source of the NaNs.
-
-# To fix this, we can do what we were going to do anyway: use Gaussians pdfs rather than dot products.
-# We'll need to get the variance of the chord templates.
-# The other problem is normalization. We've been normalizing the templates. But is that really wise?
-# Perhaps what makes the 'no-chord' so characteristic is that it doesn't have any chroma content.
-
-# We don't actually have normalized templates: the mean of unit-norm vectors is not necesarily unit norm!
-
-# Can we we make the distance calculation fast still?
-
 # TODO:
 # 1. Calculate the variance of the chord templates.
 # 2. Implement a fast distance calculation method using these variances.
-# 3. Use the normal pdf instead of the dot product for the likelihood calculation.
-# 4. Rewrite the HMM in log space.
+
+# Debugging
+# - Could see what the predictions actually are? And where it's having trouble? Is it never predicting a change?
+# - Could compare the group specific covariance matrix to the single variance parameter we're using currently.
 
 @sizecheck function mean_and_cov(x_T)
     m_C = mean(x_T)
@@ -186,22 +141,25 @@ end
     hop_count_mat = reshape(hop_counts.count, (:, 3))
     P_DM = hop_count_mat ./ sum(hop_count_mat; dims=1)
     templates_CM = reduce(hcat, combine(groupby(df, :scale), :shifted_y => (x -> [mean(x)]) => :y).y)
-    # df = combine(groupby(df, :scale), :shifted_y => (x -> mean_and_cov(x)) => [:y, :y_var])
-    # templates_CM = stack(df.y)
-    # templates_CCM = stack(df.y_var) # TODO: how to turn this into templates_DCC?
+    s = combine(df, :shifted_y => (x -> var(reduce(vcat, x))) => :var).var[1]
     templates_DC = mortar(reshape(
         [Circulant(templates_CM[:, 1]), Circulant(templates_CM[:, 2]), templates_CM[:, 3:3]], 1, 3))'
     blocks = [to_block(P_DM, i, j) for j in [1, 2, 3] for i in [1:12, 13:24, 25:25]]
     P_DD = mortar(reshape(blocks, 3, 3))
+    norms_D = StackedVector(Fill.(vec(sum(templates_CM .^ 2, dims=1)), [12,12,1]))
+    # println(norms_D)
+    println("S $s")
+    # That's odd- the norms are half of what I expected.
     sum(test_dfs) do tdf
         y_CT = reduce(hcat, tdf.y)
         z_T = tdf.z
-        pred_DT = forward_backward(P_DD, y_CT, templates_DC)
+        pred_DT = forward_backward(P_DD, y_CT, templates_DC, norms_D, s)
         mean(pred_DT[CartesianIndex.(z_T, 1:T)]) / length(test_dfs)
     end
 end
 
-# 64%? That's terrible!
+# 66%? That's terrible!
+# And when we tried to scale by variance, we went down to 60!
 function doit()
     accuracy(load_df(100)...)
 end

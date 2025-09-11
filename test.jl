@@ -1,23 +1,13 @@
 using ChordChain, Test, LinearAlgebra, StatsBase
 
-@testset "Log matmul" begin
-    for _ in 1:10
-        A = randn(3, 3)
-        b = randn(3)
-        @test all(ChordChain.log_matmul(A, b) .≈ log.(exp.(A) * exp.(b)))
-    end
-end
-
 @testset "Uniform PDD" begin
     D = 4
     P_DD = stack([ones(D) ./ D for _ in 1:D])
     obs = cumprod(0.8 * ones(D))
     y_CT = stack([circshift(obs, i) for i in 0:5])
-    results = [forward_backward_logscale(log.(P_DD), y_CT, 1.0I(4)), forward_backward(P_DD, y_CT, 1.0I(4))]
-    @test allequal(x -> trunc.(x; digits=4), results)
-    results_DT = results[1]
-    @test all(argmax.(eachcol(results_DT)) .== (mod.(0:5, 4) .+ 1))
-    @test sum(results_DT, dims=1) ≈ ones(1, 6)
+    pred_DT = forward_backward(P_DD, y_CT, 1.0I(4), ones(4), 1.0)
+    @test all(argmax.(eachcol(pred_DT)) .== (mod.(0:5, 4) .+ 1))
+    @test sum(pred_DT, dims=1) ≈ ones(1, 6)
 end
 
 @testset "Simulation" begin
@@ -38,11 +28,11 @@ end
             end
         end
 
-        results = [forward_backward_logscale(log.(P_DD), y_CT, templates_DC), forward_backward(P_DD, y_CT, templates_DC)]
-        @test allequal(x -> trunc.(x; digits=4), results)
-        pred_DT = results[1]
+        norms_D = sum(templates_DC.^2; dims=2)
+        pred_DT = forward_backward(P_DD, y_CT, templates_DC, norms_D, 0.1^2)
         expected_correct = sum(pred_DT[CartesianIndex.(z_T, 1:T)])
-        @test expected_correct >= T * 0.7
+        @test expected_correct >= T * 0.95
+        @test all(argmax.(eachcol(pred_DT)) .== z_T)
         @test sum(pred_DT, dims=1) ≈ ones(1, T)
     end
 end
