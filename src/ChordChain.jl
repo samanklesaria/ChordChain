@@ -6,6 +6,8 @@ import DataFrames: StackedVector
 using Infiltrator
 using GLMakie
 
+include("broadcast.jl")
+
 export forward_backward, load_df, accuracy, doit
 
 const ACCIDENTALS = Dict('b' => ♭, '#' => ♯)
@@ -47,8 +49,8 @@ const CHUNK = 8
             y_SC = chroma24[:, 1:12] .+ chroma24[:, 13:24] .+ 1e-8
             y_SC = circshift(y_SC, (0, -3)) # First chroma bin corresponds to A, not C
             y_SC ./= mapslices(norm, y_SC; dims=2)
-            y_SC = mapslices(x->hma(x, 13), y_SC; dims=1)
-            y_TC =y_SC[1:CHUNK:end,:]
+            y_SC = mapslices(x -> hma(x, 13), y_SC; dims=1)
+            y_TC = y_SC[1:CHUNK:end, :]
             frame_secs = CHUNK * (cqt_data[2, 2] - cqt_data[1, 2])
 
             # Extract annotations
@@ -81,13 +83,14 @@ const CHUNK = 8
     reduce(vcat, train_dfs), test_dfs
 end
 
-@sizecheck function forward_backward(P_DD, y_CT, templates_DC, template_norms_D, s)
+@sizecheck function forward_backward(P_DD, y_CT, templates_DC, template_norm_D, Lam_DC)
     z_DT = zeros(D, T)
     z_DT[:, 1] .= ones(D) ./ D
     obs_prob_T = zeros(T)
 
-    products_DT = templates_DC * y_CT
-    lik_DT = exp.((products_DT .- 0.5 .* template_norms_D) ./ s)
+    products_DT = (templates_DC .* Lam_DC) * y_CT
+    norms_DT = template_norm_D .+ Lam_DC * (y_CT .^ 2)
+    lik_DT = exp.(products_DT .- 0.5 .* norms_DT)
 
     # Forward
     for t in 1:T
@@ -119,26 +122,15 @@ function to_block(P_DM, i, j)
     end
 end
 
-# From the plot, we see that the self-transition probabilities are thousands of times higher than the transition probabilities between chords.
-# To combat this, what can we do?
-# We can use a non-exponential distribution for the chord transition timing.
-# But first things first: how well does this work?
-
-
-# Debugging
-# - Could compare the group specific covariance matrix to the single variance parameter we're using currently.
-# - If necessary, add group specific variances to the model.
-# - Could examine a case where the fit is especially poor. See what pathologies there are.
-
-# We could visualize the predictions.
-# How do we show the correct answers?
-
-@sizecheck function mean_and_cov(x_T)
+@sizecheck function mean_and_var(x_T)
     m_C = mean(x_T)
-    x_CT = stack(x_T)
-    X_CT = x_CT .- reshape(m_C, C, 1)
-    (y=[m_C], y_var=[X_CT * X_CT' ./ (T - 1)])
+    x_CT = stack(x_T) .- reshape(m_C, C, 1)
+    (y=[m_C], y_var=[vec(sum(x_CT .^ 2; dims=2) ./ (T - 1))])
 end
+
+# We're always picking no_chord. Something's screwy. Is there just no variance there?
+# No, the variances there actually look quite good.
+# But something is broken.
 
 @sizecheck function accuracy(df, test_dfs)
     all_hops = crossjoin(DataFrame(scale=0:2), DataFrame(hops=0:24))
@@ -146,23 +138,25 @@ end
     hop_counts = coalesce.(leftjoin(all_hops, hop_counts, on=[:scale, :hops], order=:left), 0)
     hop_count_mat = reshape(hop_counts.count, (:, 3))
     P_DM = hop_count_mat ./ sum(hop_count_mat; dims=1)
-    templates_CM = reduce(hcat, combine(groupby(df, :scale), :shifted_y => (x -> [mean(x)]) => :y).y)
-    s = combine(df, :shifted_y => (x -> var(reduce(vcat, x))) => :var).var[1]
+    df = combine(groupby(df, :scale), :shifted_y => (x -> mean_and_var(x)) => [:y, :y_var])
+    templates_CM = stack(df.y)
+    templates_var_CM = stack(df.y_var)
     templates_DC = mortar(reshape(
         [Circulant(templates_CM[:, 1]), Circulant(templates_CM[:, 2]), templates_CM[:, 3:3]], 1, 3))'
     blocks = [to_block(P_DM, i, j) for j in [1, 2, 3] for i in [1:12, 13:24, 25:25]]
     P_DD = mortar(reshape(blocks, 3, 3))
-    norms_D = StackedVector(Fill.(vec(sum(templates_CM .^ 2, dims=1)), [12,12,1]))
-    # norms_D = Fill(1.0, 25)
-    # println("S $s")
-
+    return templates_var_CM
+    Lam_CM = 1 ./ templates_var_CM
+    Lam_DC = mortar(reshape(
+        [Circulant(Lam_CM[:, 1]), Circulant(Lam_CM[:, 2]), Lam_CM[:, 3:3]], 1, 3))'
+    template_norm_D = (templates_DC .^ 2 .* Lam_DC) * Ones(C)
     tdf = test_dfs[1]
     # sum(test_dfs) do tdf
-        y_CT = reduce(hcat, tdf.y)
-        z_T = tdf.z
-        pred_DT = forward_backward(P_DD, y_CT, templates_DC, norms_D, s)
-        println("Accuracy ", mean(pred_DT[CartesianIndex.(z_T, 1:T)])) #  / length(test_dfs))
-        visualize_results(pred_DT, z_T)
+    y_CT = reduce(hcat, tdf.y)
+    z_T = tdf.z
+    pred_DT = forward_backward(P_DD, y_CT, templates_DC, template_norm_D, Lam_DC)
+    println("Accuracy ", mean(pred_DT[CartesianIndex.(z_T, 1:T)])) #  / length(test_dfs))
+    visualize_results(pred_DT, z_T)
     # end
 end
 

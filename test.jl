@@ -1,11 +1,11 @@
-using ChordChain, Test, LinearAlgebra, StatsBase
+using ChordChain, Test, LinearAlgebra, StatsBase, FillArrays
 
 @testset "Uniform PDD" begin
     D = 4
     P_DD = stack([ones(D) ./ D for _ in 1:D])
     obs = cumprod(0.8 * ones(D))
     y_CT = stack([circshift(obs, i) for i in 0:5])
-    pred_DT = forward_backward(P_DD, y_CT, 1.0I(4), ones(4), 1.0)
+    pred_DT = forward_backward(P_DD, y_CT, 1.0I(4), Ones(4), Ones(D,D))
     @test all(argmax.(eachcol(pred_DT)) .== (mod.(0:5, 4) .+ 1))
     @test sum(pred_DT, dims=1) ≈ ones(1, 6)
 end
@@ -27,9 +27,10 @@ end
                 z_T[t+1] = sample(ProbabilityWeights(P_DD[:, z_T[t]]))
             end
         end
-
+        Lam_DC = Fill(1/(0.1^2), D, C)
+        template_norm_D = (templates_DC .^ 2 .* Lam_DC) * Ones(C)
         norms_D = sum(templates_DC.^2; dims=2)
-        pred_DT = forward_backward(P_DD, y_CT, templates_DC, norms_D, 0.1^2)
+        pred_DT = forward_backward(P_DD, y_CT, templates_DC, norms_D, Lam_DC)
         expected_correct = sum(pred_DT[CartesianIndex.(z_T, 1:T)])
         @test expected_correct >= T * 0.95
         @test all(argmax.(eachcol(pred_DT)) .== z_T)
